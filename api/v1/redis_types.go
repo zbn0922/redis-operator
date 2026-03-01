@@ -30,9 +30,9 @@ type RedisSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	// foo is an example field of Redis. Edit redis_types.go to remove/update
-	// +optional
-	Foo *string `json:"foo,omitempty"`
+	Replicas int32  `json:"replicas,omitempty"`
+	Image    string `json:"image,omitempty"`
+	Storage  string `json:"storage,omitempty"`
 }
 
 // RedisStatus defines the observed state of Redis.
@@ -51,6 +51,9 @@ type RedisStatus struct {
 	// - "Progressing": the resource is being created or updated
 	// - "Degraded": the resource failed to reach or maintain its desired state
 	//
+
+	ReadyReplicas int32  `json:"readyReplicas,omitempty"`
+	Phase         string `json:"phase,omitempty"`
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
 	// +listMapKey=type

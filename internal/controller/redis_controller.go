@@ -47,8 +47,23 @@ type RedisReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/reconcile
 func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
+	// 1、从cache获取资源
+	var redis zbn0922v1.Redis
+	if err := r.Get(ctx, req.NamespacedName, &redis); err != nil {
+		// 如果获取不到资源应该已经删除
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	//log.GetSink().Info()
+	log.Info(
+		"Redis spec info",
+		"namespace", req.Namespace,
+		"name", req.Name,
+		"replicas", redis.Spec.Replicas, // int32 类型直接传，zap 会自动格式化
+		"image", redis.Spec.Image,
+		"storage", redis.Spec.Storage,
+	)
 	// TODO(user): your logic here
 
 	return ctrl.Result{}, nil
