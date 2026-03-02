@@ -179,6 +179,7 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		if err = r.Create(ctx, &newSts); err != nil {
 			return ctrl.Result{}, err
 		}
+		return ctrl.Result{Requeue: true}, nil
 	} else if err != nil { //出现错误后重试
 		return ctrl.Result{}, err
 	}
