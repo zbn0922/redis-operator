@@ -51,9 +51,10 @@ type RedisStatus struct {
 	// - "Progressing": the resource is being created or updated
 	// - "Degraded": the resource failed to reach or maintain its desired state
 	//
-	Replicas      int32  `json:"replicas,omitempty"`
-	ReadyReplicas int32  `json:"readyReplicas,omitempty"`
-	Phase         string `json:"phase,omitempty"`
+	Replicas           int32  `json:"replicas,omitempty"`
+	ReadyReplicas      int32  `json:"readyReplicas,omitempty"`
+	Phase              string `json:"phase,omitempty"`
+	ObservedGeneration int64  `json:"generation,omitempty"`
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
 	// +listMapKey=type

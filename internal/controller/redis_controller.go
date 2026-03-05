@@ -102,7 +102,7 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			return ctrl.Result{}, err
 		}
 		// 创建了service后，是异步更新资源，所以需要再次调用下，看下是否创建成功了
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	} else if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -219,7 +219,7 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		if err = r.Create(ctx, &newSts); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	} else if err != nil { //出现错误后重试
 		return ctrl.Result{}, err
 	}
@@ -249,22 +249,21 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// 更新cr status
-	if redis.Status.Replicas != sts.Status.Replicas ||
-		redis.Status.ReadyReplicas != sts.Status.ReadyReplicas ||
-		redis.Status.Phase == "pending" {
-
-		redis.Status.Replicas = sts.Status.Replicas
+	if redis.Status.ReadyReplicas != sts.Status.ReadyReplicas || redis.Status.Replicas != *sts.Spec.Replicas {
+		redis.Status.Replicas = *sts.Spec.Replicas
 		redis.Status.ReadyReplicas = sts.Status.ReadyReplicas
-		redis.Status.Phase = getPhase(sts)
-
+		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
+			redis.Status.Phase = "Running"
+		} else {
+			redis.Status.Phase = "Pending"
+		}
+		redis.Status.ObservedGeneration = redis.ObjectMeta.Generation
 		if err := r.Status().Update(ctx, &redis); err != nil {
 			return ctrl.Result{}, err
 		}
-
 		return ctrl.Result{}, nil
 	}
 	// TODO(user): your logic here
-
 	return ctrl.Result{}, nil
 }
 
@@ -281,6 +280,7 @@ func (r *RedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&zbn0922v1.Redis{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Service{}).
 		Named("redis").
 		Complete(r)
 }
