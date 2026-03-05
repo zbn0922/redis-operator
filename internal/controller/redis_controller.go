@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -125,6 +126,20 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 				Selector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{"app": stsName},
 				},
+				PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+					WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType, // 删StatefulSet时删PVC
+					WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType, // 缩容删Pod时删PVC（比如replicas从1→0）
+				},
+				UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+					Type: appsv1.RollingUpdateStatefulSetStrategyType,
+					// 可选：配置滚动更新的参数（比如最多不可用1个Pod）
+					RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+						MaxUnavailable: &intstr.IntOrString{
+							Type:   intstr.Int,
+							IntVal: 1, // 滚动更新时最多1个Pod不可用
+						},
+					},
+				},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
 						Labels: map[string]string{
@@ -146,6 +161,31 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 										Name:      "data",
 										MountPath: "/data",
 									},
+								},
+								// 核心：添加 Readiness Probe
+								ReadinessProbe: &corev1.Probe{
+									ProbeHandler: corev1.ProbeHandler{
+										Exec: &corev1.ExecAction{
+											Command: []string{"redis-cli", "ping"}, // 验证 Redis 服务可用
+										},
+									},
+									InitialDelaySeconds: 5, // 启动后5秒开始检测
+									PeriodSeconds:       3, // 每3秒检测一次
+									TimeoutSeconds:      1, // 检测超时1秒
+									SuccessThreshold:    1, // 1次成功即认为就绪
+									FailureThreshold:    3, // 3次失败则认为未就绪
+								},
+								// 可选：添加 Liveness Probe（检测 Redis 进程是否存活）
+								LivenessProbe: &corev1.Probe{
+									ProbeHandler: corev1.ProbeHandler{
+										Exec: &corev1.ExecAction{
+											Command: []string{"redis-cli", "ping"},
+										},
+									},
+									InitialDelaySeconds: 10,
+									PeriodSeconds:       5,
+									TimeoutSeconds:      2,
+									FailureThreshold:    3,
 								},
 							},
 						},
@@ -184,7 +224,49 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// 3、
+	// 比对期望和实际状态，如果一致则跳过，否则更新，并添加会workerqueue
+	// 从Get获取到的就是实际状态， 自定义cr就是期望值，例如statefulset 中的replicas  redis 是期望， sts是实际状态
+	if *sts.Spec.Replicas != redis.Spec.Replicas {
+		// 代表需要更新
+		sts.Spec.Replicas = &redis.Spec.Replicas
+
+		if err := r.Update(ctx, &sts); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	// image
+	//container := sts.Spec.Template.Spec.Containers[0]
+	if sts.Spec.Template.Spec.Containers[0].Image != redis.Spec.Image {
+		sts.Spec.Template.Spec.Containers[0].Image = redis.Spec.Image
+
+		if err := r.Update(ctx, &sts); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 更新cr status
+	if redis.Status.ReadyReplicas != sts.Status.ReadyReplicas ||
+		redis.Status.Replicas != *sts.Spec.Replicas {
+
+		redis.Status.Replicas = *sts.Spec.Replicas
+		redis.Status.ReadyReplicas = sts.Status.ReadyReplicas
+
+		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
+			redis.Status.Phase = "Running"
+		} else {
+			redis.Status.Phase = "Pending"
+		}
+
+		if err := r.Status().Update(ctx, &redis); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
 	// TODO(user): your logic here
 
 	return ctrl.Result{}, nil

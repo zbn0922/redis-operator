@@ -116,6 +116,17 @@ spec:
               readyReplicas:
                 format: int32
                 type: integer
+              replicas:
+                description: |-
+                  conditions represent the current state of the Redis resource.
+                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
+
+                  Standard condition types include:
+                  - "Available": the resource is fully functional
+                  - "Progressing": the resource is being created or updated
+                  - "Degraded": the resource failed to reach or maintain its desired state
+                format: int32
+                type: integer
             type: object
         required:
         - spec
