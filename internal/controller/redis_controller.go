@@ -249,17 +249,13 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// 更新cr status
-	if redis.Status.ReadyReplicas != sts.Status.ReadyReplicas ||
-		redis.Status.Replicas != *sts.Spec.Replicas {
+	if redis.Status.Replicas != sts.Status.Replicas ||
+		redis.Status.ReadyReplicas != sts.Status.ReadyReplicas ||
+		redis.Status.Phase == "pending" {
 
-		redis.Status.Replicas = *sts.Spec.Replicas
+		redis.Status.Replicas = sts.Status.Replicas
 		redis.Status.ReadyReplicas = sts.Status.ReadyReplicas
-
-		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-			redis.Status.Phase = "Running"
-		} else {
-			redis.Status.Phase = "Pending"
-		}
+		redis.Status.Phase = getPhase(sts)
 
 		if err := r.Status().Update(ctx, &redis); err != nil {
 			return ctrl.Result{}, err
@@ -272,10 +268,19 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	return ctrl.Result{}, nil
 }
 
+// getPhase 根据 StatefulSet 状态计算 Redis 的 Phase
+func getPhase(sts appsv1.StatefulSet) string {
+	if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 && sts.Status.ReadyReplicas == *sts.Spec.Replicas {
+		return "Running"
+	}
+	return "Pending"
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&zbn0922v1.Redis{}).
+		Owns(&appsv1.StatefulSet{}).
 		Named("redis").
 		Complete(r)
 }
