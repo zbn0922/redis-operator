@@ -111,7 +111,7 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              generation:
+              observedGeneration:
                 format: int64
                 type: integer
               phase:

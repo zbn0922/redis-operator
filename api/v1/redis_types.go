@@ -54,7 +54,7 @@ type RedisStatus struct {
 	Replicas           int32  `json:"replicas,omitempty"`
 	ReadyReplicas      int32  `json:"readyReplicas,omitempty"`
 	Phase              string `json:"phase,omitempty"`
-	ObservedGeneration int64  `json:"generation,omitempty"`
+	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
 	// +listMapKey=type
