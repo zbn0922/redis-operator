@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -248,20 +249,44 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, nil
 	}
 
-	// 更新cr status
-	if redis.Status.ReadyReplicas != sts.Status.ReadyReplicas || redis.Status.Replicas != *sts.Spec.Replicas {
-		redis.Status.Replicas = *sts.Spec.Replicas
-		redis.Status.ReadyReplicas = sts.Status.ReadyReplicas
-		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-			redis.Status.Phase = "Running"
-		} else {
-			redis.Status.Phase = "Pending"
-		}
-		redis.Status.ObservedGeneration = redis.ObjectMeta.Generation
+	//// 更新cr status
+	//if redis.Status.ReadyReplicas != sts.Status.ReadyReplicas || redis.Status.Replicas != *sts.Spec.Replicas {
+	//	redis.Status.Replicas = *sts.Spec.Replicas
+	//	redis.Status.ReadyReplicas = sts.Status.ReadyReplicas
+	//	if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
+	//		redis.Status.Phase = "Running"
+	//	} else {
+	//		redis.Status.Phase = "Pending"
+	//	}
+	//	redis.Status.ObservedGeneration = redis.ObjectMeta.Generation
+	//	if err := r.Status().Update(ctx, &redis); err != nil {
+	//		return ctrl.Result{}, err
+	//	}
+	//	return ctrl.Result{}, nil
+	//}
+
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+
+	newStatus := redis.Status.DeepCopy()
+
+	newStatus.Replicas = replicas
+	newStatus.ReadyReplicas = sts.Status.ReadyReplicas
+	newStatus.ObservedGeneration = redis.ObjectMeta.Generation
+
+	if sts.Status.ReadyReplicas == replicas {
+		newStatus.Phase = "Running"
+	} else {
+		newStatus.Phase = "Pending"
+	}
+
+	if !reflect.DeepEqual(redis.Status, *newStatus) {
+		redis.Status = *newStatus
 		if err := r.Status().Update(ctx, &redis); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, nil
 	}
 	// TODO(user): your logic here
 	return ctrl.Result{}, nil
