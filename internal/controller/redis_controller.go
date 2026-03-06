@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	zbn0922v1 "github.com/zbn0922/redis-operator/api/v1"
@@ -40,6 +42,8 @@ type RedisReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
+
+const RedisFinalizer = "redis.zbn0922.github.com/finalizer"
 
 // +kubebuilder:rbac:groups=zbn0922.github.com,resources=redis,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=zbn0922.github.com,resources=redis/status,verbs=get;update;patch
@@ -62,6 +66,17 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if err := r.Get(ctx, req.NamespacedName, &redis); err != nil {
 		// 如果获取不到资源应该已经删除
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	// 添加finalizer
+	if redis.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
+			controllerutil.AddFinalizer(&redis, RedisFinalizer)
+
+			if err := r.Update(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
 	}
 	//log.GetSink().Info()
 	log.Info(
@@ -288,8 +303,46 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			return ctrl.Result{}, err
 		}
 	}
+	if !redis.ObjectMeta.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
+
+			// TODO: 删除时清理资源，优雅退出，备份、日志、通知之类的,
+			if err := r.cleanupRedis(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(&redis, RedisFinalizer)
+			if err := r.Update(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
 	// TODO(user): your logic here
 	return ctrl.Result{}, nil
+}
+
+func (r *RedisReconciler) cleanupRedis(ctx context.Context, redis *zbn0922v1.Redis) error {
+
+	// 示例：删除 StatefulSet
+	//var sts appsv1.StatefulSet
+
+	//err := r.Get(ctx, types.NamespacedName{
+	//	Name:      redis.Name,
+	//	Namespace: redis.Namespace,
+	//}, &sts)
+
+	//if err == nil {
+	//	return r.Delete(ctx, &sts)
+	//}
+	log := logf.FromContext(ctx)
+
+	log.Info("start cleanupRedis")
+	// 这个时候，kubectl delete 会一直卡着，等待响应直到返回后
+	//time.Sleep(time.Minute)
+	log.Info("end cleanupRedis")
+
+	return nil
 }
 
 // getPhase 根据 StatefulSet 状态计算 Redis 的 Phase
