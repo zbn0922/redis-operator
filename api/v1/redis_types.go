@@ -30,9 +30,18 @@ type RedisSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	Replicas int32  `json:"replicas,omitempty"`
-	Image    string `json:"image,omitempty"`
-	Storage  string `json:"storage,omitempty"`
+	Replicas  int32      `json:"replicas,omitempty"`
+	Image     string     `json:"image,omitempty"`
+	Storage   string     `json:"storage,omitempty"`
+	AutoScale *AutoScale `json:"autoScale,omitempty"` // 自动扩缩容开关
+	//AutoScale bool `json:"autoScale,omitempty"` // 自动扩缩容开关
+}
+type AutoScale struct {
+	MinReplicas int32 `json:"minReplicas"`
+
+	MaxReplicas int32 `json:"maxReplicas"`
+
+	CPU int32 `json:"cpu"`
 }
 
 // RedisStatus defines the observed state of Redis.

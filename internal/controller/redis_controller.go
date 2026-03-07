@@ -21,6 +21,7 @@ import (
 	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -29,12 +30,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	zbn0922v1 "github.com/zbn0922/redis-operator/api/v1"
 )
@@ -88,11 +88,88 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"replicas", redis.Spec.Replicas, // int32 类型直接传，zap 会自动格式化
 		"image", redis.Spec.Image,
 		"storage", redis.Spec.Storage,
+		"redis_resourceVersion", redis.ResourceVersion,
+		"redis_generation", redis.Generation,
 	)
 
 	// 2、创建hardless service
+	if res, err := r.reconcileService(ctx, &redis); err != nil || res != nil {
+		return ctrl.Result{}, err
+	}
+	// 3、查看是否存在statefulset,不存在创建
+	if res, err := r.reconcileStatefulSet(ctx, &redis); err != nil || res != nil {
+		return ctrl.Result{}, err
+	}
+	//var sts appsv1.StatefulSet
+
+	// 4、自动扩缩容
+	if res, err := r.reconcileHPA(ctx, &redis); err != nil || res != nil {
+		return ctrl.Result{}, err
+	}
+	// 5、 status
+	if res, err := r.updateStatusWithRetry(ctx, &redis); err != nil || res != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 6、 清理资源
+	if !redis.ObjectMeta.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
+
+			// TODO: 删除时清理资源，优雅退出，备份、日志、通知之类的,
+			if err := r.cleanupRedis(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(&redis, RedisFinalizer)
+			if err := r.Update(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+	// TODO(user): your logic here
+	return ctrl.Result{}, nil
+}
+
+func (r *RedisReconciler) cleanupRedis(ctx context.Context, redis *zbn0922v1.Redis) error {
+
+	// 示例：删除 StatefulSet
+	//var sts appsv1.StatefulSet
+
+	//err := r.Get(ctx, types.NamespacedName{
+	//	Name:      redis.Name,
+	//	Namespace: redis.Namespace,
+	//}, &sts)
+
+	//if err == nil {
+	//	return r.Delete(ctx, &sts)
+	//}
+	log := logf.FromContext(ctx)
+
+	log.Info("start cleanupRedis")
+	// 这个时候，kubectl delete 会一直卡着，等待响应直到返回后
+	//time.Sleep(time.Minute)
+	log.Info("end cleanupRedis")
+
+	return nil
+}
+
+// getPhase 根据 StatefulSet 状态计算 Redis 的 Phase
+func getPhase(sts appsv1.StatefulSet) string {
+	if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 && sts.Status.ReadyReplicas == *sts.Spec.Replicas {
+		return "Running"
+	}
+	return "Pending"
+}
+func (r *RedisReconciler) reconcileService(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+	name := redis.Name
 	var svc corev1.Service
-	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil && apierrors.IsNotFound(err) {
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: redis.Namespace,
+	}
+	err := r.Get(ctx, key, &svc)
+	if err != nil && apierrors.IsNotFound(err) {
 		// 创建service
 		newSvc := corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -112,26 +189,31 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			},
 		}
 		// 设置引用
-		if err = ctrl.SetControllerReference(&redis, &newSvc, r.Scheme); err != nil {
-			return ctrl.Result{}, err
+		if err = ctrl.SetControllerReference(redis, &newSvc, r.Scheme); err != nil {
+			return nil, err
 		}
 		// 创建
 		if err = r.Create(ctx, &newSvc); err != nil {
-			return ctrl.Result{}, err
+			return nil, err
 		}
 		// 创建了service后，是异步更新资源，所以需要再次调用下，看下是否创建成功了
-		return ctrl.Result{}, nil
+		return &ctrl.Result{}, nil
 	} else if err != nil {
-		return ctrl.Result{}, err
+		return nil, err
 	}
-	// 3、查看是否存在statefulset
+
+	return nil, nil
+}
+
+func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
 	stsName := redis.Name
 	key := types.NamespacedName{
 		Namespace: redis.Namespace,
 		Name:      stsName,
 	}
 	var sts appsv1.StatefulSet
-	if err := r.Get(ctx, key, &sts); err != nil && apierrors.IsNotFound(err) {
+	err := r.Get(ctx, key, &sts)
+	if err != nil && apierrors.IsNotFound(err) {
 		// create
 		newSts := appsv1.StatefulSet{
 			ObjectMeta: metav1.ObjectMeta{
@@ -205,6 +287,16 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 									TimeoutSeconds:      2,
 									FailureThreshold:    3,
 								},
+								Resources: corev1.ResourceRequirements{
+									Requests: corev1.ResourceList{
+										corev1.ResourceCPU:    resource.MustParse("250m"),  // 请求 1 核
+										corev1.ResourceMemory: resource.MustParse("512Mi"), // 请求 1Gi 内存
+									},
+									Limits: corev1.ResourceList{
+										corev1.ResourceCPU:    resource.MustParse("500m"), // 限制 2 核
+										corev1.ResourceMemory: resource.MustParse("1Gi"),  // 限制 2Gi 内存
+									},
+								},
 							},
 						},
 					},
@@ -231,56 +323,110 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			},
 		}
 		// 添加资源引用, 主要的作用是在删除cr的时候同步删除cr创建的其他资源 gc watch delete
-		if err = ctrl.SetControllerReference(&redis, &newSts, r.Scheme); err != nil {
-			return ctrl.Result{}, err
+		if err = ctrl.SetControllerReference(redis, &newSts, r.Scheme); err != nil {
+			return nil, err
 		}
 		if err = r.Create(ctx, &newSts); err != nil {
-			return ctrl.Result{}, err
+			return nil, err
 		}
-		return ctrl.Result{}, nil
-	} else if err != nil { //出现错误后重试
-		return ctrl.Result{}, err
+		return &ctrl.Result{}, nil
+	}
+	return nil, nil
+}
+
+func (r *RedisReconciler) reconcileHPA(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+
+	if redis.Spec.AutoScale == nil {
+		return nil, nil
 	}
 
+	name := redis.Name
+
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: redis.Namespace,
+	}
+
+	err := r.Get(ctx, key, &hpa)
+	if err != nil && apierrors.IsNotFound(err) {
+
+		newHpa := autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: redis.Namespace,
+			},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+					APIVersion: "apps/v1",
+					Kind:       "StatefulSet",
+					Name:       name,
+				},
+
+				MinReplicas: &redis.Spec.AutoScale.MinReplicas,
+				MaxReplicas: redis.Spec.AutoScale.MaxReplicas,
+
+				Metrics: []autoscalingv2.MetricSpec{
+					{
+						Type: autoscalingv2.ResourceMetricSourceType,
+						Resource: &autoscalingv2.ResourceMetricSource{
+							Name: corev1.ResourceCPU,
+							Target: autoscalingv2.MetricTarget{
+								Type:               autoscalingv2.UtilizationMetricType,
+								AverageUtilization: &redis.Spec.AutoScale.CPU,
+							},
+						},
+					},
+				},
+			},
+		}
+
+		if err := ctrl.SetControllerReference(redis, &newHpa, r.Scheme); err != nil {
+			return nil, err
+		}
+
+		if err := r.Create(ctx, &newHpa); err != nil {
+			return nil, err
+		}
+		return &ctrl.Result{}, nil
+	}
+
+	return nil, nil
+}
+func (r *RedisReconciler) updateStatus(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+
+	stsName := redis.Name
+	key := types.NamespacedName{
+		Namespace: redis.Namespace,
+		Name:      stsName,
+	}
+	var sts appsv1.StatefulSet
+	err := r.Get(ctx, key, &sts)
+	if err != nil && apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+
+	specNew := sts.Spec.DeepCopy()
 	// 比对期望和实际状态，如果一致则跳过，否则更新，并添加会workerqueue
 	// 从Get获取到的就是实际状态， 自定义cr就是期望值，例如statefulset 中的replicas  redis 是期望， sts是实际状态
-	if *sts.Spec.Replicas != redis.Spec.Replicas {
-		// 代表需要更新
-		sts.Spec.Replicas = &redis.Spec.Replicas
-
-		if err := r.Update(ctx, &sts); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		return ctrl.Result{}, nil
+	if redis.Spec.AutoScale == nil && *specNew.Replicas != redis.Spec.Replicas {
+		// 代表需要更新(使用了hpa这个时候在使用这个容易出现乐观锁的问题)
+		specNew.Replicas = &redis.Spec.Replicas
 	}
-
 	// image
 	//container := sts.Spec.Template.Spec.Containers[0]
-	if sts.Spec.Template.Spec.Containers[0].Image != redis.Spec.Image {
-		sts.Spec.Template.Spec.Containers[0].Image = redis.Spec.Image
-
-		if err := r.Update(ctx, &sts); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	if specNew.Template.Spec.Containers[0].Image != redis.Spec.Image {
+		specNew.Template.Spec.Containers[0].Image = redis.Spec.Image
 	}
-
-	//// 更新cr status
-	//if redis.Status.ReadyReplicas != sts.Status.ReadyReplicas || redis.Status.Replicas != *sts.Spec.Replicas {
-	//	redis.Status.Replicas = *sts.Spec.Replicas
-	//	redis.Status.ReadyReplicas = sts.Status.ReadyReplicas
-	//	if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-	//		redis.Status.Phase = "Running"
-	//	} else {
-	//		redis.Status.Phase = "Pending"
-	//	}
-	//	redis.Status.ObservedGeneration = redis.ObjectMeta.Generation
-	//	if err := r.Status().Update(ctx, &redis); err != nil {
-	//		return ctrl.Result{}, err
-	//	}
-	//	return ctrl.Result{}, nil
-	//}
+	if !reflect.DeepEqual(sts.Spec, *specNew) {
+		sts.Spec = *specNew
+		if err := r.Update(ctx, &sts); err != nil {
+			return nil, err
+		}
+		return &ctrl.Result{}, nil
+	}
 
 	replicas := int32(1)
 	if sts.Spec.Replicas != nil {
@@ -317,58 +463,92 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	if !reflect.DeepEqual(redis.Status, *newStatus) {
 		redis.Status = *newStatus
-		if err := r.Status().Update(ctx, &redis); err != nil {
-			return ctrl.Result{}, err
+		if err := r.Status().Update(ctx, redis); err != nil {
+			return nil, err
 		}
+		return &ctrl.Result{}, nil
 	}
-	if !redis.ObjectMeta.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
 
-			// TODO: 删除时清理资源，优雅退出，备份、日志、通知之类的,
-			if err := r.cleanupRedis(ctx, &redis); err != nil {
-				return ctrl.Result{}, err
-			}
+	return nil, nil
 
-			controllerutil.RemoveFinalizer(&redis, RedisFinalizer)
-			if err := r.Update(ctx, &redis); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-	}
-	// TODO(user): your logic here
-	return ctrl.Result{}, nil
 }
 
-func (r *RedisReconciler) cleanupRedis(ctx context.Context, redis *zbn0922v1.Redis) error {
+func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		stsName := redis.Name
+		key := types.NamespacedName{
+			Namespace: redis.Namespace,
+			Name:      stsName,
+		}
+		var sts appsv1.StatefulSet
+		if err := r.Get(ctx, key, &sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
 
-	// 示例：删除 StatefulSet
-	//var sts appsv1.StatefulSet
+		specNew := sts.Spec.DeepCopy()
+		if redis.Spec.AutoScale == nil && *specNew.Replicas != redis.Spec.Replicas {
+			specNew.Replicas = &redis.Spec.Replicas
+		}
+		if specNew.Template.Spec.Containers[0].Image != redis.Spec.Image {
+			specNew.Template.Spec.Containers[0].Image = redis.Spec.Image
+		}
+		if !reflect.DeepEqual(sts.Spec, *specNew) {
+			sts.Spec = *specNew
+			if err := r.Update(ctx, &sts); err != nil {
+				return err
+			}
+			return nil
+		}
 
-	//err := r.Get(ctx, types.NamespacedName{
-	//	Name:      redis.Name,
-	//	Namespace: redis.Namespace,
-	//}, &sts)
+		replicas := int32(1)
+		if sts.Spec.Replicas != nil {
+			replicas = *sts.Spec.Replicas
+		}
 
-	//if err == nil {
-	//	return r.Delete(ctx, &sts)
-	//}
-	log := logf.FromContext(ctx)
+		newStatus := redis.Status.DeepCopy()
+		newStatus.Replicas = replicas
+		newStatus.ReadyReplicas = sts.Status.ReadyReplicas
+		newStatus.ObservedGeneration = redis.ObjectMeta.Generation
 
-	log.Info("start cleanupRedis")
-	// 这个时候，kubectl delete 会一直卡着，等待响应直到返回后
-	//time.Sleep(time.Minute)
-	log.Info("end cleanupRedis")
+		if sts.Status.ReadyReplicas == replicas {
+			meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "StatefulSetReady",
+				Message:            "Redis cluster ready",
+				ObservedGeneration: redis.ObjectMeta.GetGeneration(),
+				LastTransitionTime: metav1.Now(),
+			})
+		} else {
+			meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "PodsNotReady",
+				Message:            "Waiting for pods ready",
+				ObservedGeneration: redis.ObjectMeta.GetGeneration(),
+				LastTransitionTime: metav1.Now(),
+			})
+		}
 
-	return nil
-}
+		if !reflect.DeepEqual(redis.Status, *newStatus) {
+			redis.Status = *newStatus
+			if err := r.Status().Update(ctx, redis); err != nil {
+				return err
+			}
+			return nil
+		}
 
-// getPhase 根据 StatefulSet 状态计算 Redis 的 Phase
-func getPhase(sts appsv1.StatefulSet) string {
-	if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 && sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-		return "Running"
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
-	return "Pending"
+
+	return &ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -389,9 +569,11 @@ func (r *RedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	//}
 	//pc := predicate.GenerationChangedPredicate{}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&zbn0922v1.Redis{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		//For(&zbn0922v1.Redis{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&zbn0922v1.Redis{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Named("redis").
 		Complete(r)
 }

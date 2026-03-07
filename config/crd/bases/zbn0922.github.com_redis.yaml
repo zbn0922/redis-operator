@@ -39,6 +39,22 @@ spec:
           spec:
             description: spec defines the desired state of Redis
             properties:
+              autoScale:
+                properties:
+                  cpu:
+                    format: int32
+                    type: integer
+                  maxReplicas:
+                    format: int32
+                    type: integer
+                  minReplicas:
+                    format: int32
+                    type: integer
+                required:
+                - cpu
+                - maxReplicas
+                - minReplicas
+                type: object
               image:
                 type: string
               replicas:
