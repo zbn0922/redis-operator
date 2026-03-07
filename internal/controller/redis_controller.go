@@ -341,8 +341,10 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 			return err
 		}
 		specNew := sts.Spec.DeepCopy()
-		if redis.Spec.AutoScale == nil && *specNew.Replicas != redis.Spec.Replicas {
-			specNew.Replicas = &redis.Spec.Replicas
+		if redis.Spec.AutoScale == nil {
+			if specNew.Replicas == nil || *specNew.Replicas != redis.Spec.Replicas {
+				specNew.Replicas = &redis.Spec.Replicas
+			}
 		}
 		if specNew.Template.Spec.Containers[0].Image != redis.Spec.Image {
 			specNew.Template.Spec.Containers[0].Image = redis.Spec.Image
@@ -483,7 +485,7 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 		return nil, err
 	}
 
-	return &ctrl.Result{}, nil
+	return nil, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
