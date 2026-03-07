@@ -69,7 +69,23 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		// 如果获取不到资源应该已经删除
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	// 添加finalizer
+	// 1、 清理资源
+	if !redis.ObjectMeta.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
+
+			// TODO: 删除时清理资源，优雅退出，备份、日志、通知之类的,
+			if err := r.cleanupRedis(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(&redis, RedisFinalizer)
+			if err := r.Update(ctx, &redis); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+	// 2、添加finalizer
 	if redis.ObjectMeta.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
 			controllerutil.AddFinalizer(&redis, RedisFinalizer)
@@ -92,42 +108,25 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"redis_generation", redis.Generation,
 	)
 
-	// 2、创建hardless service
+	// 3、创建hardless service
 	if res, err := r.reconcileService(ctx, &redis); err != nil || res != nil {
 		return ctrl.Result{}, err
 	}
-	// 3、查看是否存在statefulset,不存在创建
+	// 4、查看是否存在statefulset,不存在创建
 	if res, err := r.reconcileStatefulSet(ctx, &redis); err != nil || res != nil {
 		return ctrl.Result{}, err
 	}
 	//var sts appsv1.StatefulSet
 
-	// 4、自动扩缩容
+	// 5、自动扩缩容
 	if res, err := r.reconcileHPA(ctx, &redis); err != nil || res != nil {
 		return ctrl.Result{}, err
 	}
-	// 5、 status
+	// 6、 status
 	if res, err := r.updateStatusWithRetry(ctx, &redis); err != nil || res != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 6、 清理资源
-	if !redis.ObjectMeta.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
-
-			// TODO: 删除时清理资源，优雅退出，备份、日志、通知之类的,
-			if err := r.cleanupRedis(ctx, &redis); err != nil {
-				return ctrl.Result{}, err
-			}
-
-			controllerutil.RemoveFinalizer(&redis, RedisFinalizer)
-			if err := r.Update(ctx, &redis); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-	}
-	// TODO(user): your logic here
 	return ctrl.Result{}, nil
 }
 
@@ -331,6 +330,34 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 		}
 		return &ctrl.Result{}, nil
 	}
+
+	// 更新
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var sts appsv1.StatefulSet
+		if err := r.Get(ctx, key, &sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		specNew := sts.Spec.DeepCopy()
+		if redis.Spec.AutoScale == nil && *specNew.Replicas != redis.Spec.Replicas {
+			specNew.Replicas = &redis.Spec.Replicas
+		}
+		if specNew.Template.Spec.Containers[0].Image != redis.Spec.Image {
+			specNew.Template.Spec.Containers[0].Image = redis.Spec.Image
+		}
+		if !reflect.DeepEqual(sts.Spec, *specNew) {
+			sts.Spec = *specNew
+			if err := r.Update(ctx, &sts); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
@@ -395,83 +422,6 @@ func (r *RedisReconciler) reconcileHPA(ctx context.Context, redis *zbn0922v1.Red
 
 	return nil, nil
 }
-func (r *RedisReconciler) updateStatus(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
-
-	stsName := redis.Name
-	key := types.NamespacedName{
-		Namespace: redis.Namespace,
-		Name:      stsName,
-	}
-	var sts appsv1.StatefulSet
-	err := r.Get(ctx, key, &sts)
-	if err != nil && apierrors.IsNotFound(err) {
-		return nil, nil
-	}
-
-	specNew := sts.Spec.DeepCopy()
-	// 比对期望和实际状态，如果一致则跳过，否则更新，并添加会workerqueue
-	// 从Get获取到的就是实际状态， 自定义cr就是期望值，例如statefulset 中的replicas  redis 是期望， sts是实际状态
-	if redis.Spec.AutoScale == nil && *specNew.Replicas != redis.Spec.Replicas {
-		// 代表需要更新(使用了hpa这个时候在使用这个容易出现乐观锁的问题)
-		specNew.Replicas = &redis.Spec.Replicas
-	}
-	// image
-	//container := sts.Spec.Template.Spec.Containers[0]
-	if specNew.Template.Spec.Containers[0].Image != redis.Spec.Image {
-		specNew.Template.Spec.Containers[0].Image = redis.Spec.Image
-	}
-	if !reflect.DeepEqual(sts.Spec, *specNew) {
-		sts.Spec = *specNew
-		if err := r.Update(ctx, &sts); err != nil {
-			return nil, err
-		}
-		return &ctrl.Result{}, nil
-	}
-
-	replicas := int32(1)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
-	}
-
-	newStatus := redis.Status.DeepCopy()
-
-	newStatus.Replicas = replicas
-	newStatus.ReadyReplicas = sts.Status.ReadyReplicas
-	newStatus.ObservedGeneration = redis.ObjectMeta.Generation
-
-	if sts.Status.ReadyReplicas == replicas {
-
-		meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "StatefulSetReady",
-			Message:            "Redis cluster ready",
-			ObservedGeneration: redis.ObjectMeta.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
-	} else {
-		meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			Reason:             "PodsNotReady",
-			Message:            "Waiting for pods ready",
-			ObservedGeneration: redis.ObjectMeta.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
-
-	}
-
-	if !reflect.DeepEqual(redis.Status, *newStatus) {
-		redis.Status = *newStatus
-		if err := r.Status().Update(ctx, redis); err != nil {
-			return nil, err
-		}
-		return &ctrl.Result{}, nil
-	}
-
-	return nil, nil
-
-}
 
 func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -486,21 +436,6 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 				return nil
 			}
 			return err
-		}
-
-		specNew := sts.Spec.DeepCopy()
-		if redis.Spec.AutoScale == nil && *specNew.Replicas != redis.Spec.Replicas {
-			specNew.Replicas = &redis.Spec.Replicas
-		}
-		if specNew.Template.Spec.Containers[0].Image != redis.Spec.Image {
-			specNew.Template.Spec.Containers[0].Image = redis.Spec.Image
-		}
-		if !reflect.DeepEqual(sts.Spec, *specNew) {
-			sts.Spec = *specNew
-			if err := r.Update(ctx, &sts); err != nil {
-				return err
-			}
-			return nil
 		}
 
 		replicas := int32(1)
