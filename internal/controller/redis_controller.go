@@ -19,20 +19,22 @@ package controller
 import (
 	"context"
 	"reflect"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	zbn0922v1 "github.com/zbn0922/redis-operator/api/v1"
 )
@@ -292,9 +294,25 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	newStatus.ObservedGeneration = redis.ObjectMeta.Generation
 
 	if sts.Status.ReadyReplicas == replicas {
-		newStatus.Phase = "Running"
+
+		meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			Reason:             "StatefulSetReady",
+			Message:            "Redis cluster ready",
+			ObservedGeneration: redis.ObjectMeta.GetGeneration(),
+			LastTransitionTime: metav1.Now(),
+		})
 	} else {
-		newStatus.Phase = "Pending"
+		meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "PodsNotReady",
+			Message:            "Waiting for pods ready",
+			ObservedGeneration: redis.ObjectMeta.GetGeneration(),
+			LastTransitionTime: metav1.Now(),
+		})
+
 	}
 
 	if !reflect.DeepEqual(redis.Status, *newStatus) {
@@ -355,8 +373,23 @@ func getPhase(sts appsv1.StatefulSet) string {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	//pc := predicate.Funcs{
+
+	//	CreateFunc: func(e event.CreateEvent) bool {
+	//		return true
+	//	},
+
+	//	UpdateFunc: func(e event.UpdateEvent) bool {
+	//		return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+	//	},
+
+	//	DeleteFunc: func(e event.DeleteEvent) bool {
+	//		return true
+	//	},
+	//}
+	//pc := predicate.GenerationChangedPredicate{}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&zbn0922v1.Redis{}).
+		For(&zbn0922v1.Redis{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Named("redis").

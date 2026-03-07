@@ -112,10 +112,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               observedGeneration:
+                description: Phase              string `json:"phase,omitempty"`
                 format: int64
                 type: integer
-              phase:
-                type: string
               readyReplicas:
                 format: int32
                 type: integer
