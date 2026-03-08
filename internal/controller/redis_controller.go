@@ -408,24 +408,57 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 	sort.Slice(readyPods, func(i, j int) bool {
 		return readyPods[i].ObjectMeta.Name < readyPods[j].ObjectMeta.Name
 	})
-	var specNum int32
-	if redis.Spec.AutoScale == nil {
-		specNum = redis.Spec.Replicas
+	//var specNum int32
+	//if redis.Spec.AutoScale == nil {
+	//	specNum = redis.Spec.Replicas
+	//} else {
+	//	specNum = *sts.Spec.Replicas
+	//}
+	//if len(readyPods) != int(specNum) { // 如果没有全部准备好，等待5秒在进行重试
+	//	return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	//}
+	if len(readyPods) < 1 {
+		return nil, nil
+	}
+	var master corev1.Pod
+	if redis.Status.Master == "" {
+		master = readyPods[0]
 	} else {
-		specNum = *sts.Spec.Replicas
-	}
-	if len(readyPods) != int(specNum) { // 如果没有全部准备好，等待5秒在进行重试
-		return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
 
-	master := readyPods[0]
+		masterPod := electNewMaster(readyPods, redis.Status.Master)
+		if masterPod == nil { // 如果没有找到新的pod那就5秒之后重试下
+			return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		master = *masterPod
+		// 新的master先no one
+		cmdNoOne := []string{
+			"redis-cli",
+			"--raw",
+			"replicaof",
+			"no",
+			"one",
+		}
+		stdout, stderr, err := r.execRedisCommand(ctx, master, cmdNoOne)
+		log.Info("statefulset get pod",
+			"replica", master.Name,
+			"ip", master.Status.PodIP,
+			"stdout", stdout,
+			"stderr", stderr,
+			"err", err,
+		)
+		if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") { // 如果出错5秒之后在重试
+			return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
 
 	masterIp := master.Status.PodIP
 	masterPort := "6379"
 	log.Info("statefulset get pod", "master", master.Name, "ip", master.Status.PodIP)
 	// pod已经全部准备好了，现在要配置主从了
-	for i := 1; i < len(readyPods); i++ {
-		pod := readyPods[i]
+	for _, pod := range readyPods {
+		if pod.GetObjectMeta().GetName() == master.GetObjectMeta().GetName() {
+			continue
+		}
 		// 判断是否已经执行过了
 		cmdInfo := []string{
 			"redis-cli",
@@ -464,6 +497,22 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 
 	}
 	return nil, nil
+}
+
+func electNewMaster(pods []corev1.Pod, oldMaster string) *corev1.Pod {
+	// 优先复用旧主且就绪的 Pod
+	for i := range pods {
+		if pods[i].Name == oldMaster && isPodReady(pods[i]) {
+			return &pods[i]
+		}
+	}
+	// 否则返回第一个就绪的非旧主 Pod
+	for i := range pods {
+		if pods[i].Name != oldMaster && isPodReady(pods[i]) {
+			return &pods[i]
+		}
+	}
+	return nil
 }
 
 // 在你的 reconciler 或 exec 函数附近加一个 helper 函数
@@ -509,6 +558,34 @@ func isAlreadyReplicaOf(infoOutput string, expectedMasterIP string, expectedMast
 	}
 
 	return false
+}
+
+func (r *RedisReconciler) findMater(ctx context.Context, pods corev1.PodList) corev1.Pod {
+	// 找到master并返回
+	var master corev1.Pod
+	for _, pod := range pods.Items {
+		if isPodReady(pod) {
+			// 判断是否已经执行过了
+			cmdInfo := []string{
+				"redis-cli",
+				"--raw",
+				"INFO",
+				"replication",
+			}
+			stdout, stderr, err := r.execRedisCommand(ctx, pod, cmdInfo)
+			//if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") || isAlreadyReplicaOf(stdout, masterIp, masterPort) {
+			if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") {
+				continue
+			}
+			// 解析 INFO replication 输出，判断当前 Pod 是否为 master
+			if strings.Contains(stdout, "role:master") {
+				master = pod
+				break
+			}
+		}
+	}
+
+	return master
 }
 
 func isPodReady(pod corev1.Pod) bool {
@@ -667,11 +744,10 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 		if err != nil {
 			return err
 		}
-		sort.Slice(pods.Items, func(i, j int) bool {
-			return pods.Items[i].ObjectMeta.Name < pods.Items[j].ObjectMeta.Name
-		})
+		master := r.findMater(ctx, pods)
+		newStatus.Master = master.ObjectMeta.Name
 
-		newStatus.Master = pods.Items[0].Name
+		//newStatus.Master = pods.Items[0].Name
 
 		if !reflect.DeepEqual(redis.Status, *newStatus) {
 			redis.Status = *newStatus

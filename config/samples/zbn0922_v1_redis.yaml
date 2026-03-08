@@ -10,7 +10,7 @@ spec:
   image: redis:6
   storage: 1Gi
   autoScale: 
-    maxReplicas: 3
-    minReplicas: 2
+    maxReplicas: 5
+    minReplicas: 3
     cpu: 5
   # TODO(user): Add fields here
