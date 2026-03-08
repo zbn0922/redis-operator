@@ -19,6 +19,9 @@ package controller
 import (
 	"context"
 	"reflect"
+	systemRuntime "runtime"
+	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -33,6 +36,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -96,18 +100,23 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			return ctrl.Result{}, nil
 		}
 	}
+
+	// 获取当前 goroutine ID
+	var buf [64]byte
+	n := systemRuntime.Stack(buf[:], false)
+	goroutineID := strings.Fields(string(buf[:n]))[1]
 	//log.GetSink().Info()
 	log.Info(
 		"Redis spec info",
-		"namespace", req.Namespace,
-		"name", req.Name,
+		"name", req.NamespacedName,
 		"replicas", redis.Spec.Replicas, // int32 类型直接传，zap 会自动格式化
 		"image", redis.Spec.Image,
 		"storage", redis.Spec.Storage,
 		"redis_resourceVersion", redis.ResourceVersion,
 		"redis_generation", redis.Generation,
+		"time", time.Now().Format("2006-01-02 15:04:05.000"),
+		"goroutineID", goroutineID,
 	)
-
 	// 3、创建hardless service
 	if res, err := r.reconcileService(ctx, &redis); err != nil || res != nil {
 		return ctrl.Result{}, err
@@ -127,6 +136,7 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	//return ctrl.Result{}, fmt.Errorf("test error") // 验证是否是指数退避，正确的这个位置应该是 return ctrl.Result{}, nil
 	return ctrl.Result{}, nil
 }
 
@@ -153,13 +163,6 @@ func (r *RedisReconciler) cleanupRedis(ctx context.Context, redis *zbn0922v1.Red
 	return nil
 }
 
-// getPhase 根据 StatefulSet 状态计算 Redis 的 Phase
-func getPhase(sts appsv1.StatefulSet) string {
-	if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 && sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-		return "Running"
-	}
-	return "Pending"
-}
 func (r *RedisReconciler) reconcileService(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
 	name := redis.Name
 	var svc corev1.Service
@@ -511,6 +514,9 @@ func (r *RedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: 5,
+		}).
 		Named("redis").
 		Complete(r)
 }
