@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"reflect"
 	systemRuntime "runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,6 +35,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,7 +52,9 @@ import (
 // RedisReconciler reconciles a Redis object
 type RedisReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	Config    *rest.Config
+	Clientset *kubernetes.Clientset
 }
 
 const RedisFinalizer = "redis.zbn0922.github.com/finalizer"
@@ -119,25 +127,33 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	)
 	// 3、创建hardless service
 	if res, err := r.reconcileService(ctx, &redis); err != nil || res != nil {
-		return ctrl.Result{}, err
+		return DefaultIfEmpty(res), err
 	}
 	// 4、查看是否存在statefulset,不存在创建
 	if res, err := r.reconcileStatefulSet(ctx, &redis); err != nil || res != nil {
-		return ctrl.Result{}, err
+		return DefaultIfEmpty(res), err
 	}
 	//var sts appsv1.StatefulSet
 
 	// 5、自动扩缩容
 	if res, err := r.reconcileHPA(ctx, &redis); err != nil || res != nil {
-		return ctrl.Result{}, err
+		return DefaultIfEmpty(res), err
 	}
 	// 6、 status
 	if res, err := r.updateStatusWithRetry(ctx, &redis); err != nil || res != nil {
-		return ctrl.Result{}, err
+		return DefaultIfEmpty(res), err
 	}
 
 	//return ctrl.Result{}, fmt.Errorf("test error") // 验证是否是指数退避，正确的这个位置应该是 return ctrl.Result{}, nil
 	return ctrl.Result{}, nil
+}
+
+// DefaultIfEmpty 如果 res 为 nil，返回默认的 empty Result，否则返回 res
+func DefaultIfEmpty(res *ctrl.Result) ctrl.Result {
+	if res != nil {
+		return *res
+	}
+	return ctrl.Result{}
 }
 
 func (r *RedisReconciler) cleanupRedis(ctx context.Context, redis *zbn0922v1.Redis) error {
@@ -208,6 +224,7 @@ func (r *RedisReconciler) reconcileService(ctx context.Context, redis *zbn0922v1
 }
 
 func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	stsName := redis.Name
 	key := types.NamespacedName{
 		Namespace: redis.Namespace,
@@ -331,6 +348,7 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 		if err = r.Create(ctx, &newSts); err != nil {
 			return nil, err
 		}
+		log.Info("statefulset create success")
 		return &ctrl.Result{}, nil
 	}
 
@@ -354,20 +372,157 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 		}
 		if !reflect.DeepEqual(sts.Spec, *specNew) {
 			sts.Spec = *specNew
-			if err := r.Update(ctx, &sts); err != nil {
+			if err = r.Update(ctx, &sts); err != nil {
 				return err
 			}
+			log.Info("statefulset update success")
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// 获取pod list（得等待完成后在进行，所以这个位置获取不到的话，直接）
+	var pods corev1.PodList
+	err = r.List(
+		ctx,
+		&pods,
+		client.InNamespace(redis.Namespace),
+		client.MatchingLabels{
+			"app": redis.Name,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// 找到已经ready的pod
+	var readyPods []corev1.Pod
+	for _, item := range pods.Items {
+		if isPodReady(item) {
+			readyPods = append(readyPods, item)
+		}
+	}
+	// 对readyPods 进行排序，因为这个顺序是由apiserver决定的，不一定是排序好的
+	sort.Slice(readyPods, func(i, j int) bool {
+		return readyPods[i].ObjectMeta.Name < readyPods[j].ObjectMeta.Name
+	})
+	var specNum int32
+	if redis.Spec.AutoScale == nil {
+		specNum = redis.Spec.Replicas
+	} else {
+		specNum = *sts.Spec.Replicas
+	}
+	if len(readyPods) != int(specNum) { // 如果没有全部准备好，等待5秒在进行重试
+		return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	master := readyPods[0]
+
+	masterIp := master.Status.PodIP
+	masterPort := "6379"
+	log.Info("statefulset get pod", "master", master.Name, "ip", master.Status.PodIP)
+	// pod已经全部准备好了，现在要配置主从了
+	for i := 1; i < len(readyPods); i++ {
+		pod := readyPods[i]
+		// 判断是否已经执行过了
+		cmdInfo := []string{
+			"redis-cli",
+			"--raw",
+			"INFO",
+			"replication",
+		}
+		stdout, stderr, err := r.execRedisCommand(ctx, pod, cmdInfo)
+		log.Info("statefulset get pod",
+			"replica", pod.Name,
+			"ip", pod.Status.PodIP,
+			"stdout", stdout,
+			"stderr", stderr,
+			"err", err,
+		)
+		if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") || isAlreadyReplicaOf(stdout, masterIp, masterPort) {
+			continue
+		}
+
+		cmd := []string{
+			"redis-cli",
+			"--raw",
+			"replicaof",
+			master.Status.PodIP,
+			"6379",
+		}
+
+		stdoutReplica, stderrReplica, err := r.execRedisCommand(ctx, pod, cmd)
+		log.Info("statefulset get pod",
+			"replica", pod.Name,
+			"ip", pod.Status.PodIP,
+			"stdout", stdoutReplica,
+			"stderr", stderrReplica,
+			"err", err,
+		)
+
+	}
 	return nil, nil
 }
 
-func (r *RedisReconciler) reconcileHPA(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+// 在你的 reconciler 或 exec 函数附近加一个 helper 函数
+func isAlreadyReplicaOf(infoOutput string, expectedMasterIP string, expectedMasterPort string) bool {
+	lines := strings.Split(infoOutput, "\n")
 
+	var role, masterHost, masterPort string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue // 跳过空行和 section 头
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		switch key {
+		case "role":
+			role = value
+		case "master_host":
+			masterHost = value
+		case "master_port":
+			masterPort = value
+			// 可以根据需要再加其他字段，比如 master_link_status == "up"
+		}
+	}
+
+	// 判断条件：必须是 slave，且 master 的 IP 和端口完全匹配
+	if role == "slave" &&
+		masterHost == expectedMasterIP &&
+		masterPort == expectedMasterPort {
+
+		// 可选：再加更严格的检查
+		// if masterLinkStatus != "up" { return false }
+
+		return true
+	}
+
+	return false
+}
+
+func isPodReady(pod corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady &&
+			cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *RedisReconciler) reconcileHPA(ctx context.Context, redis *zbn0922v1.Redis) (*ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	if redis.Spec.AutoScale == nil {
 		return nil, nil
 	}
@@ -425,6 +580,33 @@ func (r *RedisReconciler) reconcileHPA(ctx context.Context, redis *zbn0922v1.Red
 		return &ctrl.Result{}, nil
 	}
 
+	// 更新
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var hpa autoscalingv2.HorizontalPodAutoscaler
+		if err := r.Get(ctx, key, &hpa); err != nil {
+			return err
+		}
+		specNew := hpa.Spec.DeepCopy()
+
+		if redis.Spec.AutoScale.MaxReplicas != specNew.MaxReplicas {
+			specNew.MaxReplicas = redis.Spec.AutoScale.MaxReplicas
+		}
+
+		if redis.Spec.AutoScale.MinReplicas != *specNew.MinReplicas {
+			specNew.MinReplicas = &redis.Spec.AutoScale.MinReplicas
+		}
+		if !reflect.DeepEqual(hpa.Spec, *specNew) {
+			hpa.Spec = *specNew
+			if err = r.Update(ctx, &hpa); err != nil {
+				return err
+			}
+			log.Info("hpa update success")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
@@ -473,6 +655,24 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 			})
 		}
 
+		var pods corev1.PodList
+		err := r.List(
+			ctx,
+			&pods,
+			client.InNamespace(redis.Namespace),
+			client.MatchingLabels{
+				"app": redis.Name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		sort.Slice(pods.Items, func(i, j int) bool {
+			return pods.Items[i].ObjectMeta.Name < pods.Items[j].ObjectMeta.Name
+		})
+
+		newStatus.Master = pods.Items[0].Name
+
 		if !reflect.DeepEqual(redis.Status, *newStatus) {
 			redis.Status = *newStatus
 			if err := r.Status().Update(ctx, redis); err != nil {
@@ -489,6 +689,46 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 	}
 
 	return nil, nil
+}
+
+func (r *RedisReconciler) execRedisCommand(ctx context.Context, pod corev1.Pod, command []string) (string, string, error) {
+
+	req := r.Clientset.CoreV1().
+		RESTClient().
+		Post().
+		Resource("pods").
+		Name(pod.Name).
+		Namespace(pod.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "redis",
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+			Stdin:     true,
+			TTY:       false,
+		}, scheme.ParameterCodec) // 注意这里的scheme需要是 	"k8s.io/client-go/kubernetes/scheme"
+
+	u := req.URL()
+	logf.FromContext(ctx).Info("Exec URL", "url", u.String())
+	executor, err := remotecommand.NewSPDYExecutor(
+		r.Config,
+		"POST",
+		req.URL(),
+	)
+	if err != nil {
+		return "", "", err
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  strings.NewReader(""),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	return stdout.String(), stderr.String(), err
 }
 
 // SetupWithManager sets up the controller with the Manager.

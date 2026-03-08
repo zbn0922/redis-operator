@@ -11,6 +11,6 @@ spec:
   storage: 1Gi
   autoScale: 
     maxReplicas: 3
-    minReplicas: 1
+    minReplicas: 2
     cpu: 5
   # TODO(user): Add fields here
