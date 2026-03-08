@@ -82,7 +82,7 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	// 1、 清理资源
-	if !redis.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !redis.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
 
 			// TODO: 删除时清理资源，优雅退出，备份、日志、通知之类的,
@@ -98,7 +98,7 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 	// 2、添加finalizer
-	if redis.ObjectMeta.DeletionTimestamp.IsZero() {
+	if redis.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(&redis, RedisFinalizer) {
 			controllerutil.AddFinalizer(&redis, RedisFinalizer)
 
@@ -406,7 +406,7 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 	}
 	// 对readyPods 进行排序，因为这个顺序是由apiserver决定的，不一定是排序好的
 	sort.Slice(readyPods, func(i, j int) bool {
-		return readyPods[i].ObjectMeta.Name < readyPods[j].ObjectMeta.Name
+		return readyPods[i].Name < readyPods[j].Name
 	})
 	//var specNum int32
 	//if redis.Spec.AutoScale == nil {
@@ -424,36 +424,36 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 	if redis.Status.Master == "" {
 		master = readyPods[0]
 	} else {
-
 		masterPod := electNewMaster(readyPods, redis.Status.Master)
 		if masterPod == nil { // 如果没有找到新的pod那就5秒之后重试下
 			return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		master = *masterPod
-		// 新的master先no one
-		cmdNoOne := []string{
-			"redis-cli",
-			"--raw",
-			"replicaof",
-			"no",
-			"one",
-		}
-		stdout, stderr, err := r.execRedisCommand(ctx, master, cmdNoOne)
-		log.Info("statefulset get pod",
-			"replica", master.Name,
-			"ip", master.Status.PodIP,
-			"stdout", stdout,
-			"stderr", stderr,
-			"err", err,
-		)
-		if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") { // 如果出错5秒之后在重试
-			return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
+	}
+	// 新的master先no one
+	cmdNoOne := []string{
+		"redis-cli",
+		"--raw",
+		"replicaof",
+		"no",
+		"one",
+	}
+	stdout, stderr, err := r.execRedisCommand(ctx, master, cmdNoOne)
+	log.Info("statefulset get pod",
+		"replica", master.Name,
+		"ip", master.Status.PodIP,
+		"stdout", stdout,
+		"stderr", stderr,
+		"err", err,
+	)
+	if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") { // 如果出错5秒之后在重试
+		return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	masterIp := master.Status.PodIP
+	// Use Service DNS name instead of PodIP
+	masterDNS := master.Name + "." + redis.Name + "." + redis.Namespace + ".svc.cluster.local"
 	masterPort := "6379"
-	log.Info("statefulset get pod", "master", master.Name, "ip", master.Status.PodIP)
+	log.Info("statefulset get pod", "master", master.Name, "dns", masterDNS)
 	// pod已经全部准备好了，现在要配置主从了
 	for _, pod := range readyPods {
 		if pod.GetObjectMeta().GetName() == master.GetObjectMeta().GetName() {
@@ -474,7 +474,7 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 			"stderr", stderr,
 			"err", err,
 		)
-		if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") || isAlreadyReplicaOf(stdout, masterIp, masterPort) {
+		if err != nil || stderr != "" || strings.HasPrefix(stdout, "ERR") || isAlreadyReplicaOf(stdout, masterDNS, masterPort) {
 			continue
 		}
 
@@ -482,7 +482,7 @@ func (r *RedisReconciler) reconcileStatefulSet(ctx context.Context, redis *zbn09
 			"redis-cli",
 			"--raw",
 			"replicaof",
-			master.Status.PodIP,
+			masterDNS,
 			"6379",
 		}
 
@@ -710,7 +710,7 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 		newStatus := redis.Status.DeepCopy()
 		newStatus.Replicas = replicas
 		newStatus.ReadyReplicas = sts.Status.ReadyReplicas
-		newStatus.ObservedGeneration = redis.ObjectMeta.Generation
+		newStatus.ObservedGeneration = redis.Generation
 
 		if sts.Status.ReadyReplicas == replicas {
 			meta.SetStatusCondition(&newStatus.Conditions, metav1.Condition{
@@ -718,7 +718,7 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 				Status:             metav1.ConditionTrue,
 				Reason:             "StatefulSetReady",
 				Message:            "Redis cluster ready",
-				ObservedGeneration: redis.ObjectMeta.GetGeneration(),
+				ObservedGeneration: redis.GetGeneration(),
 				LastTransitionTime: metav1.Now(),
 			})
 		} else {
@@ -727,7 +727,7 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 				Status:             metav1.ConditionFalse,
 				Reason:             "PodsNotReady",
 				Message:            "Waiting for pods ready",
-				ObservedGeneration: redis.ObjectMeta.GetGeneration(),
+				ObservedGeneration: redis.GetGeneration(),
 				LastTransitionTime: metav1.Now(),
 			})
 		}
@@ -745,7 +745,7 @@ func (r *RedisReconciler) updateStatusWithRetry(ctx context.Context, redis *zbn0
 			return err
 		}
 		master := r.findMater(ctx, pods)
-		newStatus.Master = master.ObjectMeta.Name
+		newStatus.Master = master.Name
 
 		//newStatus.Master = pods.Items[0].Name
 
